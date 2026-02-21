@@ -1,4 +1,5 @@
 import React, { useRef, useMemo, useEffect } from 'react';
+import logoSrc from '../assets/logo.png';
 import { Canvas, useFrame } from '@react-three/fiber';
 import { motion, useScroll, useTransform, useSpring } from 'framer-motion';
 import * as THREE from 'three';
@@ -416,7 +417,7 @@ export default function App() {
           className="flex items-center gap-4 pointer-events-auto"
         >
           <img 
-            src="/image_2.png" 
+            src={logoSrc}
             alt="MindFlow Logo" 
             className="w-10 h-10 object-contain"
             style={{ filter: 'brightness(0) invert(1)' }}
