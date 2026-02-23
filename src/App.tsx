@@ -6,6 +6,25 @@ import { motion, useScroll, useTransform, useSpring } from 'framer-motion';
 import { MeshSurfaceSampler } from 'three-stdlib';
 import * as THREE from 'three';
 
+// ─── Shared drag state ────────────────────────────────────────────────────────
+//
+// Plain mutable object — no React state — so reads in useFrame never cause
+// re-renders, and both ParticleSystem and BlackBox always see the same values.
+
+const drag = {
+  yaw:      0,   // accumulated horizontal offset (radians)
+  pitch:    0,   // accumulated vertical offset   (radians)
+  velYaw:   0,   // inertia velocity (radians / frame)
+  velPitch: 0,
+  active:   false,
+  lastX:    0,
+  lastY:    0,
+};
+
+const DRAG_SENS   = 0.004;
+const DAMPING     = 0.90;
+const PITCH_LIMIT = Math.PI * 0.45;
+
 // ─── Brain mesh sampler hook ──────────────────────────────────────────────────
 
 function useBrainTargets(count: number): Float32Array {
@@ -14,9 +33,7 @@ function useBrainTargets(count: number): Float32Array {
   return useMemo(() => {
     let brainMesh: THREE.Mesh | null = null;
     scene.traverse((o) => {
-      if (!brainMesh && (o as THREE.Mesh).isMesh) {
-        brainMesh = o as THREE.Mesh;
-      }
+      if (!brainMesh && (o as THREE.Mesh).isMesh) brainMesh = o as THREE.Mesh;
     });
 
     if (!brainMesh) {
@@ -24,22 +41,16 @@ function useBrainTargets(count: number): Float32Array {
       return new Float32Array(count * 3);
     }
 
-    // Clone so we don't mutate the cached scene
     const mesh = (brainMesh as THREE.Mesh).clone();
     mesh.geometry = (brainMesh as THREE.Mesh).geometry.clone();
     mesh.updateMatrixWorld(true);
 
     const sampler = new MeshSurfaceSampler(mesh).build();
     const pos = new THREE.Vector3();
-    const normal = new THREE.Vector3();
     const out = new Float32Array(count * 3);
 
     for (let i = 0; i < count; i++) {
-      sampler.sample(pos, normal);
-
-      // Tiny outward jitter along normal to give ridge-like depth variation
-      // pos.addScaledVector(normal, Math.random() * 0.08);
-
+      sampler.sample(pos);
       out[i * 3 + 0] = pos.x;
       out[i * 3 + 1] = pos.y;
       out[i * 3 + 2] = pos.z;
@@ -47,6 +58,66 @@ function useBrainTargets(count: number): Float32Array {
 
     return out;
   }, [scene, count]);
+}
+
+// ─── Window-level pointer listeners (registered once) ────────────────────────
+//
+// Called inside ParticleSystem via useDragListeners(). BlackBox doesn't need
+// to register its own — they all write to the same `drag` object.
+
+function useDragListeners() {
+  useEffect(() => {
+    const onMove = (e: PointerEvent) => {
+      if (!drag.active) return;
+
+      const dx = e.clientX - drag.lastX;
+      const dy = e.clientY - drag.lastY;
+      drag.lastX = e.clientX;
+      drag.lastY = e.clientY;
+
+      drag.velYaw   = dx * DRAG_SENS;
+      drag.velPitch = dy * DRAG_SENS;
+
+      drag.yaw += drag.velYaw;
+      drag.pitch = Math.max(-PITCH_LIMIT, Math.min(PITCH_LIMIT, drag.pitch + drag.velPitch));
+
+      e.preventDefault(); // prevent scroll / text-select while dragging
+    };
+
+    const onUp = () => { drag.active = false; };
+
+    window.addEventListener('pointermove', onMove, { passive: false });
+    window.addEventListener('pointerup',   onUp);
+    return () => {
+      window.removeEventListener('pointermove', onMove as EventListener);
+      window.removeEventListener('pointerup',   onUp);
+    };
+  }, []);
+}
+
+// ─── Shared helpers ───────────────────────────────────────────────────────────
+
+// Call from any R3F onPointerDown to begin a drag
+function startDrag(e: any) {
+  if (e.pointerType === 'mouse' && e.button !== 0) return;
+  drag.active = true;
+  drag.lastX  = e.clientX;
+  drag.lastY  = e.clientY;
+  e.target?.setPointerCapture?.(e.pointerId);
+  e.stopPropagation();
+}
+
+// Advance inertia once per frame (call from whichever useFrame runs first).
+// BlackBox reads drag.yaw / drag.pitch directly — no double-ticking needed.
+function advanceDragInertia() {
+  if (drag.active) return;
+  drag.yaw   += drag.velYaw;
+  drag.pitch += drag.velPitch;
+  drag.pitch  = Math.max(-PITCH_LIMIT, Math.min(PITCH_LIMIT, drag.pitch));
+  drag.velYaw   *= DAMPING;
+  drag.velPitch *= DAMPING;
+  if (Math.abs(drag.velYaw)   < 1e-5) drag.velYaw   = 0;
+  if (Math.abs(drag.velPitch) < 1e-5) drag.velPitch = 0;
 }
 
 // ─── 2-D neural canvas (hero background) ─────────────────────────────────────
@@ -60,54 +131,49 @@ const NeuralCanvas = ({ scrollProgress }: { scrollProgress: any }) => {
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    let animationFrameId: number;
+    let animId: number;
     let particles: Particle[] = [];
-    const particleCount = Math.min(window.innerWidth / 10, 150);
+    const count = Math.min(window.innerWidth / 10, 150);
     let mouse = { x: -1000, y: -1000 };
 
     const resize = () => {
-      canvas.width = window.innerWidth;
+      canvas.width  = window.innerWidth;
       canvas.height = window.innerHeight;
-      initParticles();
+      particles = [];
+      for (let i = 0; i < count; i++) particles.push(new Particle());
     };
 
     class Particle {
       x: number; y: number; vx: number; vy: number; size: number;
       constructor() {
-        this.x = Math.random() * canvas.width;
-        this.y = Math.random() * canvas.height;
-        this.vx = (Math.random() - 0.5) * 0.5;
-        this.vy = (Math.random() - 0.5) * 0.5;
+        this.x    = Math.random() * canvas.width;
+        this.y    = Math.random() * canvas.height;
+        this.vx   = (Math.random() - 0.5) * 0.5;
+        this.vy   = (Math.random() - 0.5) * 0.5;
         this.size = Math.random() * 1.5 + 0.5;
       }
       update() {
         this.x += this.vx; this.y += this.vy;
-        if (this.x < 0 || this.x > canvas.width) this.vx *= -1;
-        if (this.y < 0 || this.y > canvas.height) this.vy *= -1;
+        if (this.x < 0 || this.x > canvas.width)  this.vx *= -1;
+        if (this.y < 0 || this.y > canvas.height)  this.vy *= -1;
       }
       draw() {
-        if (!ctx) return;
-        ctx.beginPath();
-        ctx.arc(this.x, this.y, this.size, 0, Math.PI * 2);
-        ctx.fillStyle = 'rgba(255, 255, 255, 0.4)';
-        ctx.fill();
+        ctx!.beginPath();
+        ctx!.arc(this.x, this.y, this.size, 0, Math.PI * 2);
+        ctx!.fillStyle = 'rgba(255,255,255,0.4)';
+        ctx!.fill();
       }
     }
-
-    const initParticles = () => {
-      particles = [];
-      for (let i = 0; i < particleCount; i++) particles.push(new Particle());
-    };
 
     const drawConnections = () => {
       for (let i = 0; i < particles.length; i++) {
         for (let j = i + 1; j < particles.length; j++) {
           const dx = particles[i].x - particles[j].x;
           const dy = particles[i].y - particles[j].y;
-          const distance = Math.sqrt(dx * dx + dy * dy);
-          if (distance < 150) {
+          const d  = Math.sqrt(dx*dx + dy*dy);
+          if (d < 150) {
             ctx.beginPath();
-            ctx.strokeStyle = `rgba(255, 255, 255, ${0.15 * (1 - distance / 150)})`;
+            ctx.strokeStyle = `rgba(255,255,255,${0.15*(1-d/150)})`;
             ctx.lineWidth = 0.5;
             ctx.moveTo(particles[i].x, particles[i].y);
             ctx.lineTo(particles[j].x, particles[j].y);
@@ -116,10 +182,10 @@ const NeuralCanvas = ({ scrollProgress }: { scrollProgress: any }) => {
         }
         const dxM = particles[i].x - mouse.x;
         const dyM = particles[i].y - mouse.y;
-        const dM = Math.sqrt(dxM * dxM + dyM * dyM);
+        const dM  = Math.sqrt(dxM*dxM + dyM*dyM);
         if (dM < 250) {
           ctx.beginPath();
-          ctx.strokeStyle = `rgba(255, 230, 0, ${0.6 * (1 - dM / 250)})`;
+          ctx.strokeStyle = `rgba(255,230,0,${0.6*(1-dM/250)})`;
           ctx.lineWidth = 1.5;
           ctx.moveTo(particles[i].x, particles[i].y);
           ctx.lineTo(mouse.x, mouse.y);
@@ -134,31 +200,20 @@ const NeuralCanvas = ({ scrollProgress }: { scrollProgress: any }) => {
       ctx.clearRect(0, 0, canvas.width, canvas.height);
       particles.forEach(p => { p.update(); p.draw(); });
       drawConnections();
-      animationFrameId = requestAnimationFrame(animate);
+      animId = requestAnimationFrame(animate);
     };
 
-    window.addEventListener('resize', resize);
+    window.addEventListener('resize',    resize);
     window.addEventListener('mousemove', (e) => { mouse.x = e.clientX; mouse.y = e.clientY; });
-    window.addEventListener('mouseout', () => { mouse.x = -1000; mouse.y = -1000; });
+    window.addEventListener('mouseout',  ()  => { mouse.x = -1000; mouse.y = -1000; });
 
     resize();
     animate();
-
-    return () => {
-      window.removeEventListener('resize', resize);
-      cancelAnimationFrame(animationFrameId);
-    };
+    return () => { window.removeEventListener('resize', resize); cancelAnimationFrame(animId); };
   }, []);
 
   const opacity = useTransform(scrollProgress, [0, 0.05, 0.15], [1, 1, 0]);
-
-  return (
-    <motion.canvas
-      ref={canvasRef}
-      style={{ opacity }}
-      className="fixed inset-0 w-full h-full z-0 bg-mf-dark"
-    />
-  );
+  return <motion.canvas ref={canvasRef} style={{ opacity }} className="fixed inset-0 w-full h-full z-0 bg-mf-dark" />;
 };
 
 // ─── 3-D particle system ──────────────────────────────────────────────────────
@@ -172,42 +227,30 @@ const ParticleSystem = ({
   scrollProgress: any;
   brainTargets: Float32Array;
 }) => {
-  const groupRef = useRef<THREE.Group>(null);
+  const groupRef    = useRef<THREE.Group>(null);
   const materialRef = useRef<THREE.ShaderMaterial>(null);
 
-  const positions = useMemo(() => {
-    const random = new Float32Array(PARTICLE_COUNT * 3);
-    const box = new Float32Array(PARTICLE_COUNT * 3);
-    const brain = new Float32Array(PARTICLE_COUNT * 3);
-    const randomOffsets = new Float32Array(PARTICLE_COUNT);
+  // Register window pointer listeners — only this component does it
+  useDragListeners();
 
-    // Compute bounding box of raw brain targets to auto-scale
-    let maxVal = 0;
-    for (let i = 0; i < PARTICLE_COUNT * 3; i++) {
-      if (Math.abs(brainTargets[i]) > maxVal) maxVal = Math.abs(brainTargets[i]);
-    }
-    // Target display size ~5 units; guard against zero (fallback)
-    // const scale = maxVal > 0 ? 5.0 / maxVal : 1.0;
-    const scale = 5.0;
+  const positions = useMemo(() => {
+    const random        = new Float32Array(PARTICLE_COUNT * 3);
+    const box           = new Float32Array(PARTICLE_COUNT * 3);
+    const brain         = new Float32Array(PARTICLE_COUNT * 3);
+    const randomOffsets = new Float32Array(PARTICLE_COUNT);
+    const scale         = 5.0;
 
     for (let i = 0; i < PARTICLE_COUNT; i++) {
       const i3 = i * 3;
-
-      // Random floating cloud
       random[i3]     = (Math.random() - 0.5) * 50;
       random[i3 + 1] = (Math.random() - 0.5) * 50;
       random[i3 + 2] = (Math.random() - 0.5) * 50;
-
-      // Solid cube
-      box[i3]     = (Math.random() - 0.5) * 5.1;
-      box[i3 + 1] = (Math.random() - 0.5) * 5.1;
-      box[i3 + 2] = (Math.random() - 0.5) * 5.1;
-
-      // Real brain surface positions (auto-scaled)
-      brain[i3]     = brainTargets[i3]     * scale;
-      brain[i3 + 1] = brainTargets[i3 + 1] * scale;
-      brain[i3 + 2] = brainTargets[i3 + 2] * scale;
-
+      box[i3]        = (Math.random() - 0.5) * 5.1;
+      box[i3 + 1]    = (Math.random() - 0.5) * 5.1;
+      box[i3 + 2]    = (Math.random() - 0.5) * 5.1;
+      brain[i3]      = brainTargets[i3]     * scale;
+      brain[i3 + 1]  = brainTargets[i3 + 1] * scale;
+      brain[i3 + 2]  = brainTargets[i3 + 2] * scale;
       randomOffsets[i] = Math.random() * Math.PI * 2;
     }
 
@@ -277,18 +320,23 @@ const ParticleSystem = ({
 
   useFrame((state) => {
     const s = scrollProgress.get();
+
     if (materialRef.current) {
       materialRef.current.uniforms.uScroll.value = s;
-      materialRef.current.uniforms.uTime.value = state.clock.elapsedTime;
+      materialRef.current.uniforms.uTime.value   = state.clock.elapsedTime;
     }
+
+    // ParticleSystem advances inertia — BlackBox will just read drag.yaw/pitch
+    advanceDragInertia();
+
     if (groupRef.current) {
-      groupRef.current.rotation.y = state.clock.elapsedTime * 0.05 + s * Math.PI * 2;
-      groupRef.current.rotation.x = s * Math.PI * 0.5;
+      groupRef.current.rotation.y = state.clock.elapsedTime * 0.05 + s * Math.PI * 2 + drag.yaw;
+      groupRef.current.rotation.x = s * Math.PI * 0.5 + drag.pitch;
     }
   });
 
   return (
-    <group ref={groupRef}>
+    <group ref={groupRef} onPointerDown={startDrag}>
       <points>
         <bufferGeometry>
           <bufferAttribute attach="attributes-position"  count={PARTICLE_COUNT} array={positions.random}        itemSize={3} />
@@ -312,12 +360,13 @@ const BrainParticleSystem = ({ scrollProgress }: { scrollProgress: any }) => {
 // ─── Black box ────────────────────────────────────────────────────────────────
 
 const BlackBox = ({ scrollProgress }: { scrollProgress: any }) => {
-  const groupRef = useRef<THREE.Group>(null);
+  const groupRef    = useRef<THREE.Group>(null);
   const solidMatRef = useRef<THREE.MeshPhysicalMaterial>(null);
-  const wireMatRef = useRef<THREE.MeshBasicMaterial>(null);
+  const wireMatRef  = useRef<THREE.MeshBasicMaterial>(null);
 
   useFrame(() => {
     const s = scrollProgress.get();
+
     let opacity = 0;
     if (s > 0.1 && s <= 0.3)       opacity = (s - 0.1) / 0.2;
     else if (s > 0.3 && s <= 0.4)  opacity = 1;
@@ -328,9 +377,13 @@ const BlackBox = ({ scrollProgress }: { scrollProgress: any }) => {
 
     if (groupRef.current) {
       groupRef.current.scale.set(scale, scale, scale);
-      groupRef.current.rotation.y = s * Math.PI * 2;
-      groupRef.current.rotation.x = s * Math.PI * 0.5;
+      // Mirror ParticleSystem's rotation exactly — same scroll base + same drag offset.
+      // advanceDragInertia() has already been called this frame by ParticleSystem,
+      // so we just read the already-updated drag.yaw / drag.pitch values.
+      groupRef.current.rotation.y = s * Math.PI * 2 + drag.yaw;
+      groupRef.current.rotation.x = s * Math.PI * 0.5 + drag.pitch;
     }
+
     if (solidMatRef.current) {
       solidMatRef.current.opacity = opacity * 0.95;
       solidMatRef.current.visible = opacity > 0;
@@ -342,7 +395,8 @@ const BlackBox = ({ scrollProgress }: { scrollProgress: any }) => {
   });
 
   return (
-    <group ref={groupRef}>
+    // Dragging on the box itself also works — writes to the same drag object
+    <group ref={groupRef} onPointerDown={startDrag}>
       <mesh>
         <boxGeometry args={[6.2, 6.2, 6.2]} />
         <meshPhysicalMaterial ref={solidMatRef} color="#020202" metalness={0.9} roughness={0.1} transparent depthWrite={false} />
@@ -380,15 +434,11 @@ export default function App() {
 
       <NeuralCanvas scrollProgress={smoothProgress} />
 
-      {/* 3-D canvas */}
-      <div className="fixed inset-0 z-0 pointer-events-none">
+      {/* pointer-events-auto so clicks on the canvas register for drag */}
+      <div className="fixed inset-0 z-0 pointer-events-auto">
         <Canvas camera={{ position: [0, 0, 15], fov: 45 }}>
           <ambientLight intensity={0.5} />
           <directionalLight position={[10, 10, 10]} intensity={2} />
-          {/*
-            Suspense lets the GLTF load asynchronously without blocking the rest
-            of the page. Particles start in the random-cloud state while loading.
-          */}
           <Suspense fallback={null}>
             <BrainParticleSystem scrollProgress={smoothProgress} />
           </Suspense>
